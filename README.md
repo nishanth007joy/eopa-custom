@@ -15,3 +15,33 @@ A version of OPA designed for data heavy workloads, with data-filtering function
   for more information.
 
 See also, [Developer Documentation](./DEVELOPMENT.md).
+
+S3 EOPA Data plugin
+
+How it works:
+
+AWS SDK v2 Default Credential Chain:
+1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+2. Shared credentials/config files (~/.aws/credentials)
+3. Web Identity Token (AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE) ← IRSA
+4. ECS container credentials
+5. EC2 instance metadata
+
+So with my changes, when you omit access_id and secret, the SDK's default chain kicks in and automatically uses IRSA if those env vars are set by EKS.
+
+The explicit IRSA config I added is only needed if:
+- You want to override the environment variables with different values
+- You're using web identity tokens outside standard EKS (custom setup)
+
+For standard EKS IRSA, the SDK does it all directly. You just need:
+
+plugins:
+data:
+s3.mydata:
+type: s3
+url: s3://my-bucket/data.json
+path: data.s3
+
+The previous implementation required access_id and secret, which forced static credentials and bypassed the SDK's default chain entirely. Now that they're optional, the SDK's
+built-in IRSA support works automatically.
+

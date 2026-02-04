@@ -9,14 +9,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/open-policy-agent/opa/v1/logging"
 	"github.com/open-policy-agent/opa/v1/plugins"
@@ -56,15 +59,64 @@ func (c *Data) Start(ctx context.Context) error {
 		return fmt.Errorf("prepare rego_transform: %w", err)
 	}
 	c.hc = &http.Client{}
+
 	cfg, err := config.LoadDefaultConfig(
 		ctx,
 		config.WithHTTPClient(c.hc),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(c.Config.AccessID, c.Config.Secret, "")),
 		config.WithRegion(c.Config.region),
 	)
 	if err != nil {
 		return err
 	}
+
+	// Build credential chain following this priority:
+	// 1. Static credentials (if provided via access_id and secret)
+	// 2. Default credential chain (environment variables, shared config, EC2/ECS roles)
+	// 3. IRSA Web Identity Token (for EKS service accounts)
+	var providers []aws.CredentialsProvider
+
+	// Static credentials take highest priority if provided
+	if c.Config.AccessID != "" && c.Config.Secret != "" {
+		providers = append(providers, credentials.NewStaticCredentialsProvider(
+			c.Config.AccessID, c.Config.Secret, ""))
+	}
+
+	// Add default credential chain (includes environment variables and IAM roles)
+	providers = append(providers, cfg.Credentials)
+
+	// Handle IRSA (Web Identity Token) for EKS service accounts
+	// Configuration can be provided explicitly or via environment variables
+	tokenFile := c.Config.WebIdentityTokenFile
+	if tokenFile == "" {
+		tokenFile = os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
+	}
+	roleARN := c.Config.RoleARN
+	if roleARN == "" {
+		roleARN = os.Getenv("AWS_ROLE_ARN")
+	}
+
+	if tokenFile != "" && roleARN != "" {
+		roleSessionName := c.Config.RoleSessionName
+		if roleSessionName == "" {
+			roleSessionName = os.Getenv("AWS_ROLE_SESSION_NAME")
+		}
+		if roleSessionName == "" {
+			roleSessionName = "eopa-session"
+		}
+
+		stsClient := sts.NewFromConfig(cfg)
+		providers = append(providers, stscreds.NewWebIdentityRoleProvider(
+			stsClient,
+			roleARN,
+			stscreds.IdentityTokenFile(tokenFile),
+			func(o *stscreds.WebIdentityRoleOptions) {
+				o.RoleSessionName = roleSessionName
+			},
+		))
+	}
+
+	// Update config's credentials provider with our credential chain
+	cfg.Credentials = newChainProvider(providers...)
 
 	// endpoint and ForcePath should be populated by the config logic.
 	s3Options := []func(*s3.Options){}
@@ -240,4 +292,26 @@ func (c *Data) download(ctx context.Context, svc *s3.Client, key string) (io.Rea
 	}
 
 	return bytes.NewReader(buf.Bytes()), nil
+}
+
+// newChainProvider creates a credentials provider that tries each provider in order
+// until one succeeds. This is needed because AWS SDK v2 doesn't have a built-in
+// equivalent to v1's credentials.NewChainCredentials().
+// Ref: https://github.com/aws/aws-sdk-go-v2/issues/1433#issuecomment-939537514
+func newChainProvider(providers ...aws.CredentialsProvider) aws.CredentialsProvider {
+	return aws.NewCredentialsCache(
+		aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+			var errs []error
+
+			for _, p := range providers {
+				if creds, err := p.Retrieve(ctx); err == nil {
+					return creds, nil
+				} else {
+					errs = append(errs, err)
+				}
+			}
+
+			return aws.Credentials{}, fmt.Errorf("no valid providers in chain: %v", errs)
+		}),
+	)
 }

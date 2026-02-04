@@ -39,14 +39,21 @@ func (factory) Validate(_ *plugins.Manager, config []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c.AccessID == "" {
-		return nil, fmt.Errorf("access_id required")
-	}
-	if c.Secret == "" {
-		return nil, fmt.Errorf("secret required")
-	}
 	if c.URL == "" {
 		return nil, fmt.Errorf("url required")
+	}
+
+	// Validate credential configuration:
+	// Either both access_id and secret must be provided (static credentials),
+	// or neither (to use environment variables, IAM roles, or IRSA)
+	if (c.AccessID == "") != (c.Secret == "") {
+		return nil, fmt.Errorf("access_id and secret must both be provided or both be omitted")
+	}
+
+	// Validate IRSA configuration: if one is provided, both must be provided
+	// (unless relying on environment variables)
+	if (c.RoleARN != "") != (c.WebIdentityTokenFile != "") {
+		return nil, fmt.Errorf("role_arn and web_identity_token_file must both be provided or both be omitted")
 	}
 
 	u, err := url.Parse(c.URL)
